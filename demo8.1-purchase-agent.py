@@ -30,11 +30,15 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import interrupt, Command
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.tools import tool
+from pydantic import BaseModel, Field
+from datetime import datetime, timedelta
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
 class ProcurementState(TypedDict):
     request: str
+    quantity: int
     vendors: list[dict]
     quotes: list[dict]
     best_quote: dict
@@ -43,41 +47,89 @@ class ProcurementState(TypedDict):
     notification: str
 
 
+
+class RequestAnalysis(BaseModel):
+    """Information to extract from the user's procurement request."""
+    quantity: int = Field(description="The number of units requested as an integer.")
+
+
 # ─── LLM (used only for the notification step to make it feel "agentic") ─────
 
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite")
-
+llm = ChatGoogleGenerativeAI(model="gemma-4-31b-it")
+#gemini-2.5-flash-lite
+#gemini-3.1-flash-lite-preview
+#gemma-4-31B-it
+#gemini-2.5-flash
 
 # ─── Node functions ──────────────────────────────────────────────────────────
 
+@tool
+def get_unit_price(vendor: str) -> float:
+    """
+    Retrieves the unit price for a specific hardware vendor.
+
+    Args:
+        vendor: The name of the vendor (e.g., 'Dell', 'Lenovo', 'HP').
+    """
+    prices = {"Dell": 248.0, "Lenovo": 235.0, "HP": 259.0}
+    return float(prices.get(vendor, 0.0))
+
+# ─── LLM & Tools ──────────────────────────────────────────────────────────────
+
+
+llm_with_tools = llm.bind_tools([get_unit_price])
+
+@tool
+def get_unit_price(vendor: str) -> float:
+    """Retrieves the unit price for a specific vendor. Args: vendor: Name of vendor."""
+    prices = {"Dell": 248.0, "Lenovo": 235.0, "HP": 259.0}
+    return float(prices.get(vendor, 0.0))
+
+llm_with_tools = llm.bind_tools([get_unit_price])
+
+# ─── Nodes ───────────────────────────────────────────────────────────────────
+
 def lookup_vendors(state: ProcurementState) -> dict:
-    """Step 1: Look up approved vendors for laptops."""
-    print("\n[Step 1] Looking up approved vendors...")
-    time.sleep(1)  # simulate API call
+    print("\n[Step 1] Analyzing request and identifying vendors...")
+    
+    analyzer = llm.with_structured_output(RequestAnalysis)
+    analysis = analyzer.invoke(f"Extract quantity as integer: {state['request']}")
+   
     vendors = [
-        {"name": "Dell", "id": "V-001", "category": "laptops", "rating": 4.5},
-        {"name": "Lenovo", "id": "V-002", "category": "laptops", "rating": 4.3},
-        {"name": "HP", "id": "V-003", "category": "laptops", "rating": 4.1},
+        {"name": "Dell", "id": "V-001", "delivery_days": 5, "rating": 4.5},
+        {"name": "Lenovo", "id": "V-002", "delivery_days": 7, "rating": 4.3},
+        {"name": "HP", "id": "V-003", "delivery_days": 4, "rating": 4.1},
     ]
-    for v in vendors:
-        print(f"   Found vendor: {v['name']} (rating {v['rating']})")
-    return {"vendors": vendors}
+    
+    print(f"   ✓ Extracted Quantity: {analysis.quantity} units")
+    return {"vendors": vendors, "quantity": analysis.quantity}
 
 
 def fetch_pricing(state: ProcurementState) -> dict:
-    """Step 2: Fetch current pricing from all 3 suppliers."""
-    print("\n[Step 2] Fetching pricing from suppliers...")
-    time.sleep(1.5)  # simulate multiple API calls
-    quotes = [
-        {"vendor": "Dell", "unit_price": 248, "total": 12_400, "delivery_days": 5},
-        {"vendor": "Lenovo", "unit_price": 235, "total": 11_750, "delivery_days": 7},
-        {"vendor": "HP", "unit_price": 259, "total": 12_950, "delivery_days": 4},
-    ]
-    for q in quotes:
-        print(f"   {q['vendor']}: €{q['unit_price']}/unit x 50 = €{q['total']:,} "
-              f"({q['delivery_days']} day delivery)")
+    print("\n[Step 2] Fetching pricing via tool calls...")
+    
+    qty = state["quantity"]
+    today = datetime.now()
+    quotes = []
+    for v in state["vendors"]:
+        v_name = v["name"]
+        ai_msg = llm_with_tools.invoke(f"What is the price for {v_name}?")
+        if ai_msg.tool_calls:
+            unit_price = get_unit_price.invoke(ai_msg.tool_calls[0]['args'])
+        else:
+            unit_price = 0.0 # Fallback
+        arrival_date = today + timedelta(days=v["delivery_days"])
+        date_str = arrival_date.strftime("%b %d, %Y")
+        total = unit_price * qty
+        quotes.append({
+            "vendor": v_name,
+            "unit_price": unit_price,
+            "total": total,
+            "delivery_days": v["delivery_days"],
+            "delivery_date": date_str
+        })
+        print(f"   {v_name}: €{unit_price}/unit x {qty} = €{total:,} (Arrives: {date_str})")
     return {"quotes": quotes}
-
 
 def compare_quotes(state: ProcurementState) -> dict:
     """Step 3: Compare quotes and pick the best one."""
@@ -88,6 +140,23 @@ def compare_quotes(state: ProcurementState) -> dict:
     print(f"   (Saves €{max(q['total'] for q in state['quotes']) - best['total']:,} "
           f"vs most expensive option)")
     return {"best_quote": best}
+
+
+def route_post_comparison(state: ProcurementState):
+    """Decide whether to request approval or go straight to purchase."""
+    if state["best_quote"]["total"] > 10000:
+        return "require_approval"
+    return "skip_approval"
+
+def route_after_approval(state: ProcurementState):
+    """Router 2: Manager Decision Check"""
+    status = state.get("approval_status", "").lower()
+    if "reject" in status:
+        return "rejected"
+    return "approved"
+
+
+
 
 
 def request_approval(state: ProcurementState) -> dict:
@@ -101,7 +170,7 @@ def request_approval(state: ProcurementState) -> dict:
     print(f"   │  APPROVAL NEEDED                            │")
     print(f"   │  Vendor:   {best['vendor']:<33}│")
     print(f"   │  Amount:   {amount_str:<33}│")
-    print(f"   │  Items:    50 laptops for engineering team  │")
+    print(f"   │  Items:    {state['quantity']} laptops for engineering team  │")
     print(f"   │  Delivery: {delivery_str:<33}│")
     print(f"   └─────────────────────────────────────────────┘")
 
@@ -110,7 +179,7 @@ def request_approval(state: ProcurementState) -> dict:
     # The process can now exit completely. When resumed later (even days later),
     # execution continues right here with the resume value.
     decision = interrupt({
-        "message": f"Approve purchase of 50 laptops from {best['vendor']} for €{best['total']:,}?",
+        "message": f"Approve purchase of {state['quantity']} laptops from {best['vendor']} for €{best['total']:,}?",
         "vendor": best["vendor"],
         "amount": best["total"],
     })
@@ -121,9 +190,6 @@ def request_approval(state: ProcurementState) -> dict:
 
 def submit_purchase_order(state: ProcurementState) -> dict:
     """Step 5: Submit the purchase order to the ERP system."""
-    if "reject" in state["approval_status"].lower():
-        print("\n[Step 5] Purchase REJECTED by manager. Aborting.")
-        return {"po_number": "REJECTED"}
 
     print("\n[Step 5] Submitting purchase order to ERP system...")
     time.sleep(1)
@@ -138,26 +204,18 @@ def notify_employee(state: ProcurementState) -> dict:
     """Step 6: Use LLM to draft and send a notification to the employee."""
     print("\n[Step 6] Notifying employee...")
 
-    if state["po_number"] == "REJECTED":
-        prompt = (
-            f"Write a brief, professional notification (2-3 sentences) to an employee "
-            f"that their purchase request for 50 laptops was rejected by the manager. "
-            f"Be empathetic but concise."
-        )
+
+    status = state.get("approval_status", "Approved (Automatic)")
+    is_rejected = "reject" in status.lower()
+
+    if is_rejected:
+        prompt = f"Inform employee request for {state['quantity']} laptops was REJECTED. Reason: {status}"
     else:
-        prompt = (
-            f"Write a brief, professional notification (2-3 sentences) to an employee "
-            f"that their purchase request has been approved and processed. "
-            f"Details: 50 laptops from {state['best_quote']['vendor']}, "
-            f"€{state['best_quote']['total']:,}, PO number {state['po_number']}, "
-            f"delivery in {state['best_quote']['delivery_days']} business days."
-        )
+        prompt = f"Inform employee request for {state['quantity']} was APPROVED. PO: {state.get('po_number', 'N/A')}"
 
     response = llm.invoke(prompt)
-    notification = response.content
-    print(f"   Employee notification sent:")
-    print(f"   \"{notification}\"")
-    return {"notification": notification}
+    print(f"   Notification: \"{response.content}\"")
+    return {"notification": response.content}
 
 
 # ─── Build the graph ─────────────────────────────────────────────────────────
@@ -178,8 +236,8 @@ builder.add_node("notify_employee", notify_employee)
 builder.add_edge(START, "lookup_vendors")
 builder.add_edge("lookup_vendors", "fetch_pricing")
 builder.add_edge("fetch_pricing", "compare_quotes")
-builder.add_edge("compare_quotes", "request_approval")
-builder.add_edge("request_approval", "submit_purchase_order")
+builder.add_conditional_edges("compare_quotes", route_post_comparison,{"require_approval": "request_approval", "skip_approval": "submit_purchase_order"})
+builder.add_conditional_edges("request_approval",route_after_approval,{"approved": "submit_purchase_order", "rejected": "notify_employee"})
 builder.add_edge("submit_purchase_order", "notify_employee")
 builder.add_edge("notify_employee", END)
 
@@ -192,16 +250,18 @@ config = {"configurable": {"thread_id": THREAD_ID}}
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
-
+order_amount = 20
 def run_first_invocation(graph):
     """First run: employee submits request, agent does steps 1-3, then suspends."""
     print("=" * 60)
     print("  FIRST INVOCATION — Employee submits purchase request")
     print("=" * 60)
-    print("\nEmployee request: \"Order 50 laptops for the new engineering team\"")
+    print(f"\nEmployee request: \"Order {order_amount} laptops for the new engineering team\"")
+   #print("\nEmployee request: \"Order 50 laptops for the new engineering team\"")
 
     result = graph.invoke(
-        {"request": "Order 50 laptops for the new engineering team"},
+        {"request": f"Order {order_amount} laptops for the new engineering team"},
+        #{"request": "Order 50 laptops for the new engineering team"},
         config,
     )
 
