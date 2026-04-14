@@ -33,7 +33,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
-
+import requests
 # ─── State ────────────────────────────────────────────────────────────────────
 
 class ProcurementState(TypedDict):
@@ -61,23 +61,26 @@ llm = ChatGoogleGenerativeAI(model="gemma-4-31b-it")
 #gemma-4-31B-it
 #gemini-2.5-flash
 
-# ─── Node functions ──────────────────────────────────────────────────────────
-
-@tool
-def get_unit_price(vendor: str) -> float:
-    """
-    Retrieves the unit price for a specific hardware vendor.
-
-    Args:
-        vendor: The name of the vendor (e.g., 'Dell', 'Lenovo', 'HP').
-    """
-    prices = {"Dell": 248.0, "Lenovo": 235.0, "HP": 259.0}
-    return float(prices.get(vendor, 0.0))
-
 # ─── LLM & Tools ──────────────────────────────────────────────────────────────
+@tool
+def search_market_prices(category: str = "laptops") -> list[dict]:
+    """
+    Fetches real-time product data from the external market API.
+    Args:
+        category: The product category to search for.
+    """
+    url = f"https://dummyjson.com/products/category/{category}"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return response.json().get("products", [])
+    except Exception as e:
+        print(f"Warning: Market API call failed: {e}")
+        return []
 
+# NOW we bind the tool (Fixes your NameError)
+llm_with_tools = llm.bind_tools([search_market_prices])
 
-llm_with_tools = llm.bind_tools([get_unit_price])
 
 @tool
 def get_unit_price(vendor: str) -> float:
@@ -90,45 +93,70 @@ llm_with_tools = llm.bind_tools([get_unit_price])
 # ─── Nodes ───────────────────────────────────────────────────────────────────
 
 def lookup_vendors(state: ProcurementState) -> dict:
-    print("\n[Step 1] Analyzing request and identifying vendors...")
+    print("\n[Step 1] Analyzing request and setting market category...")
     
     analyzer = llm.with_structured_output(RequestAnalysis)
     analysis = analyzer.invoke(f"Extract quantity as integer: {state['request']}")
-   
-    vendors = [
-        {"name": "Dell", "id": "V-001", "delivery_days": 5, "rating": 4.5},
-        {"name": "Lenovo", "id": "V-002", "delivery_days": 7, "rating": 4.3},
-        {"name": "HP", "id": "V-003", "delivery_days": 4, "rating": 4.1},
-    ]
     
-    print(f"   ✓ Extracted Quantity: {analysis.quantity} units")
-    return {"vendors": vendors, "quantity": analysis.quantity}
-
+    # We no longer hardcode specific vendors here; 
+    # the market search will find them for us.
+    return {"quantity": analysis.quantity}
 
 def fetch_pricing(state: ProcurementState) -> dict:
-    print("\n[Step 2] Fetching pricing via tool calls...")
+    print("\n[Step 2] Scanning market for cheapest deals (max 2-week delivery)...")
     
     qty = state["quantity"]
     today = datetime.now()
-    quotes = []
-    for v in state["vendors"]:
-        v_name = v["name"]
-        ai_msg = llm_with_tools.invoke(f"What is the price for {v_name}?")
-        if ai_msg.tool_calls:
-            unit_price = get_unit_price.invoke(ai_msg.tool_calls[0]['args'])
-        else:
-            unit_price = 0.0 # Fallback
-        arrival_date = today + timedelta(days=v["delivery_days"])
-        date_str = arrival_date.strftime("%b %d, %Y")
-        total = unit_price * qty
-        quotes.append({
-            "vendor": v_name,
-            "unit_price": unit_price,
-            "total": total,
-            "delivery_days": v["delivery_days"],
-            "delivery_date": date_str
-        })
-        print(f"   {v_name}: €{unit_price}/unit x {qty} = €{total:,} (Arrives: {date_str})")
+
+    # 1. Ask LLM to use the search tool
+    ai_msg = llm_with_tools.invoke("Search for available laptops in the current market.")
+    
+    raw_products = []
+    if ai_msg.tool_calls:
+        # Call the tool with the LLM's suggested category
+        raw_products = search_market_prices.invoke(ai_msg.tool_calls[0]['args'])
+
+    # 2. Filtering: Only items available within ~2 weeks
+    # Logic: Reject "month", reject "week" > 2.
+    valid_products = []
+    for p in raw_products:
+        ship_info = p.get("shippingInformation", "").lower()
+        # Filter out slow shipping
+        if "month" in ship_info or "3 weeks" in ship_info or "4 weeks" in ship_info:
+            continue
+        valid_products.append(p)
+
+    # 3. Fallback & Selection
+    if not valid_products:
+        print("   Warning: No products met criteria! Falling back to defaults.")
+        # Fallback to a safe default if API is empty or filtering was too strict
+        quotes = [{
+            "vendor": "Generic Supplier", 
+            "product_name": "Standard Business Laptop",
+            "unit_price": 499.0, "total": 499.0 * qty, 
+            "delivery_days": 10, "delivery_date": (today + timedelta(days=10)).strftime("%b %d, %Y")
+        }]
+    else:
+        # 4. Sorting: Cheapest first
+        valid_products.sort(key=lambda x: x["price"])
+        
+        quotes = []
+        # Take the top 3 cheapest valid deals
+        for p in valid_products[:3]:
+            # Estimate delivery days from string (default to 7 if parsing fails)
+            # DummyJSON format: "Ships in 1-2 business days"
+            quotes.append({
+                "vendor": p.get("brand", "Unknown Vendor"),
+                "product_name": p.get("title"), 
+                "unit_price": p["price"],
+                "total": p["price"] * qty,
+                "delivery_days": 7, 
+                "delivery_date": (today + timedelta(days=7)).strftime("%b %d, %Y")
+            })
+
+    for q in quotes:
+        print(f"   ✓ Found: {q['product_name']} at €{q['unit_price']}/unit")
+
     return {"quotes": quotes}
 
 def compare_quotes(state: ProcurementState) -> dict:
@@ -162,6 +190,10 @@ def route_after_approval(state: ProcurementState):
 def request_approval(state: ProcurementState) -> dict:
     """Step 4: Human-in-the-loop — request manager approval for orders > €10,000."""
     best = state["best_quote"]
+
+    # Pass the actual product name from DummyJSON to the UI
+    product_model = best.get("product_name", "Laptops")
+
     print("\n[Step 4] Order exceeds €10,000 — manager approval required!")
     print(f"   Sending approval request to manager...")
     amount_str = f"€{best['total']:,}"
@@ -179,9 +211,8 @@ def request_approval(state: ProcurementState) -> dict:
     # The process can now exit completely. When resumed later (even days later),
     # execution continues right here with the resume value.
     decision = interrupt({
-        "message": f"Approve purchase of {state['quantity']} laptops from {best['vendor']} for €{best['total']:,}?",
-        "vendor": best["vendor"],
-        "amount": best["total"],
+        "message": f"Approve purchase of {state['quantity']} {product_model} from {best['vendor']} for €{best['total']:,}?",
+        "product": product_model
     })
 
     print(f"\n[Step 4] Manager responded: {decision}")
